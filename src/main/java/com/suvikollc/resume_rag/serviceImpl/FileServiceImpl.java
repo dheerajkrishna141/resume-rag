@@ -1,13 +1,18 @@
 package com.suvikollc.resume_rag.serviceImpl;
 
+import java.io.ByteArrayInputStream;
 import java.io.InputStream;
 import java.time.OffsetDateTime;
 import java.util.List;
+import java.util.regex.Pattern;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.ai.document.Document;
+import org.springframework.ai.reader.tika.TikaDocumentReader;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
+import org.springframework.core.io.InputStreamResource;
 import org.springframework.data.domain.Page;
 import org.springframework.data.domain.PageImpl;
 import org.springframework.data.domain.PageRequest;
@@ -41,7 +46,6 @@ public class FileServiceImpl implements FileService {
 	@Autowired
 	private JdRepository jdRepository;
 
-
 	@Value("${azure.storage.resume.container.name}")
 	private String resumeContainerName;
 
@@ -54,18 +58,23 @@ public class FileServiceImpl implements FileService {
 	@Transactional
 	public <T extends File> T uploadFile(MultipartFile file, Class<T> fileType) {
 		String containerName = getContainerName(fileType);
-		BlobContainerClient blobContainerClient = blobServiceClient.getBlobContainerClient(containerName);
-
 		String blobName = file.getOriginalFilename();
 
-		BlobClient blobClient = blobContainerClient.getBlobClient(blobName);
+		var blobClient = getBlobClient(blobName, containerName);
 
 		try (InputStream inputStream = file.getInputStream()) {
 
+			byte[] fileBytes = inputStream.readAllBytes();
+
+			var emailId = getEmailId(new ByteArrayInputStream(fileBytes));
+
 			var savedFile = createFileInstance(fileType, file.getOriginalFilename(), blobName);
+			if (savedFile instanceof Resume) {
+				((Resume) savedFile).setEmailId(emailId);
+			}
 			savedFile = saveFile(savedFile);
 
-			blobClient.upload(inputStream, file.getSize(), true);
+			blobClient.upload(new ByteArrayInputStream(fileBytes), file.getSize(), true);
 
 			return savedFile;
 
@@ -75,11 +84,22 @@ public class FileServiceImpl implements FileService {
 
 			log.error("Error uploading file: deleting blob {}", blobName, e);
 
+			var repo = getRepository(createFileInstance(fileType, file.getOriginalFilename(), blobName));
+			T existingFile = repo.findByFileName(blobName);
+			if (existingFile != null) {
+				repo.delete(existingFile);
+			}
 			blobClient.deleteIfExists();
 
 			throw new RuntimeException("Failed to upload file: " + e.getMessage(), e);
 		}
 
+	}
+
+	public BlobClient getBlobClient(String blobName, String containerName) {
+		BlobContainerClient blobContainerClient = blobServiceClient.getBlobContainerClient(containerName);
+		BlobClient blobClient = blobContainerClient.getBlobClient(blobName);
+		return blobClient;
 	}
 
 	private String getContainerName(Class<?> fileType) {
@@ -148,11 +168,12 @@ public class FileServiceImpl implements FileService {
 
 		log.info("Generating sharable URL for file: {}", blobName);
 		try {
-			var blobContainerClient = blobServiceClient.getBlobContainerClient(containerName);
-			var blobClient = blobContainerClient.getBlobClient(blobName);
+
+			var blobClient = getBlobClient(blobName, containerName);
+
 			if (!blobClient.exists()) {
 				log.error("File not found for generating sharable URL: {}", blobName);
-				return null;
+				throw new RuntimeException("File not found: " + blobName);
 			}
 			OffsetDateTime expiryTime = OffsetDateTime.now().plusDays(1);
 
@@ -217,6 +238,57 @@ public class FileServiceImpl implements FileService {
 		PageImpl<FileDTO<T>> paginatedFiles = new PageImpl<>(fileDtos, pageable, file.getTotalElements());
 
 		return paginatedFiles;
+	}
+
+	public String extractContent(InputStream stream) {
+		try {
+			StringBuilder contentBuilder = new StringBuilder();
+			var resource = new InputStreamResource(stream);
+			var tikaReader = new TikaDocumentReader(resource);
+			tikaReader.get().stream().forEach(doc -> {
+				contentBuilder.append(doc.getText());
+			});
+
+			return contentBuilder.toString();
+		} catch (Exception e) {
+			log.error("Error extracting content from stream: {}", e.getMessage());
+			throw new RuntimeException("Error extracting content", e);
+		}
+	}
+
+	public String extractContent(List<Document> documents) {
+
+		StringBuilder contentBuilder = new StringBuilder();
+		documents.stream().forEach(doc -> {
+			contentBuilder.append(doc.getText());
+		});
+		return contentBuilder.toString();
+	}
+
+	private String getEmailId(InputStream inputStream) {
+		String content = extractContent(inputStream);
+
+		String emailRegex = "\\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\\.[A-Z|a-z]{2,}\\b";
+
+		Pattern pattern = Pattern.compile(emailRegex);
+		var matcher = pattern.matcher(content);
+		if (matcher.find()) {
+			return matcher.group();
+		} else {
+			log.warn("No email found in the content");
+			return null;
+		}
+	}
+
+	@SuppressWarnings("unchecked")
+	@Override
+	public <T extends File> T getFileByFileName(String fileName, Class<T> fileType) {
+		if (fileType.equals(Resume.class)) {
+			return (T) resumeRepository.findByFileName(fileName);
+		} else if (fileType.equals(Jd.class)) {
+			return (T) jdRepository.findByFileName(fileName);
+		}
+		return null;
 	}
 
 }
