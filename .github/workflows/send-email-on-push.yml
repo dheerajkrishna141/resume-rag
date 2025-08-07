@@ -3,8 +3,7 @@ name: Send Email on Push to Main
 on:
   push:
     branches:
-      - feature/email-service # Trigger this workflow on pushes to the 'main' branch
-
+      - main # Trigger this workflow on pushes to the 'main' branch
 jobs:
   send_commit_email:
     runs-on: ubuntu-latest # Run the job on an Ubuntu virtual machine
